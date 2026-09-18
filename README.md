@@ -48,6 +48,14 @@ local working hours.
   `DAILY`/`WEEKLY` rules with `INTERVAL` 1–4 (grid gaps → `EXDATE`,
   out-of-grid instances → `RDATE`) plus a `DTSTART`+`RDATE` fallback, and
   guarantees the result expands back to exactly the same instances
+- `/freebusy-export` turns several calendars (each with its own
+  `calendar_id`, ICS and IANA timezone) into stably sorted **VFREEBUSY**
+  text over one shared UTC window: `STATUS:CANCELLED` is ignored,
+  `TRANSP:TRANSPARENT` does not block busy time (recurring instances
+  inherit the master's `TRANSP`, an explicit override wins), and `DATE`
+  all-day events occupy whole local days in the calendar's own timezone
+  (23/25-hour spans across DST); busy spans are clipped and merged
+  (overlapping or adjacent)
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -55,12 +63,20 @@ Stack: Python · FastAPI · icalendar · python-dateutil · zoneinfo
 
 ## Quick start (Docker Compose)
 
+One command — builds the image and starts the API on **port 8000**:
+
 ```bash
 docker compose up --build
 ```
 
-The API listens on **http://localhost:8000** (interactive docs at `/docs`,
-health check at `/health`).
+The service is then reachable at **http://localhost:8000** (interactive
+docs at **http://localhost:8000/docs**, health check at
+**http://localhost:8000/health**). A quick smoke test:
+
+```bash
+curl -s http://localhost:8000/health
+# {"status":"ok"}
+```
 
 ## API
 
@@ -1047,6 +1063,95 @@ ends, including the Wednesday `RDATE` and without the Jan 12 `EXDATE`. With
 only one or two instances the response instead has `"strategy": "RDATE"` and
 carries them all after `DTSTART` — which is the byte-minimal representation.
 
+### `POST /freebusy-export`
+
+Export one RFC 5545 **VFREEBUSY** document per calendar over one shared UTC
+query window. Each calendar is expanded with the same engine as `/expand`;
+the surviving busy spans are clipped to the window, merged (overlapping or
+adjacent), and rendered as `FREEBUSY` periods sorted stably by start, then
+end.
+
+Request body:
+
+| Field             | Type     | Description                                                  |
+| ----------------- | -------- | ------------------------------------------------------------ |
+| `window_start`    | string   | Start of the shared UTC window (ISO 8601, naive = UTC)       |
+| `window_end`      | string   | End of the shared UTC window (ISO 8601, naive = UTC)         |
+| `calendars`       | array    | At least one calendar object; `calendar_id` values must be unique |
+| `calendars[].calendar_id` | string | Non-empty name echoed back with that calendar's result |
+| `calendars[].ics` | string   | iCalendar text (one or more `VEVENT`s)                       |
+| `calendars[].timezone` | string | IANA timezone of this calendar, used to place `DATE` all-day events on local whole days |
+
+Busy rules:
+
+- `STATUS:CANCELLED` (cancelled master or `RECURRENCE-ID` override) is
+  ignored;
+- `TRANSP:TRANSPARENT` does not block busy time. Recurring instances
+  **inherit** the master event's `TRANSP`; a `RECURRENCE-ID` override that
+  explicitly declares `TRANSP` overrides the inherited value for that one
+  occurrence, while an override without `TRANSP` keeps inheriting;
+- timed instances contribute their UTC `[start, end)` span (non-positive
+  durations contribute nothing);
+- `DATE` all-day events occupy whole local days in *that calendar's*
+  `timezone`: the authored dates are re-localized per day with `zoneinfo`,
+  so spring-forward days span 23 hours and fall-back days 25 hours in UTC.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/freebusy-export \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "window_start": "2026-03-01T00:00:00Z",
+    "window_end": "2026-03-15T00:00:00Z",
+    "calendars": [
+      {
+        "calendar_id": "alice",
+        "timezone": "America/New_York",
+        "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260302T100000Z\r\nDTEND:20260302T110000Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:standup\r\nRECURRENCE-ID:20260303T100000Z\r\nDTSTART:20260303T100000Z\r\nDTEND:20260303T110000Z\r\nTRANSP:TRANSPARENT\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekend\r\nDTSTART;VALUE=DATE:20260307\r\nDTEND;VALUE=DATE:20260309\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      },
+      {
+        "calendar_id": "bob",
+        "timezone": "Asia/Tokyo",
+        "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:b1\r\nDTSTART;VALUE=DATE:20260305\r\nDTEND;VALUE=DATE:20260306\r\nEND:VEVENT\r\nEND:VCALENDAR"
+      }
+    ]
+  }'
+```
+
+Alice's Mar 3 standup override is transparent (only Mar 2 is busy), and her
+Mar 7–8 all-day block is rendered as New York local days
+(`05:00Z`→`04:00Z`, the two days merging across the DST transition). Bob's
+Tokyo day is `2026-03-04T15:00Z` to `2026-03-05T15:00Z`:
+
+```json
+{
+  "window_start": "2026-03-01T00:00:00Z",
+  "window_end": "2026-03-15T00:00:00Z",
+  "count": 2,
+  "calendars": [
+    {
+      "calendar_id": "alice",
+      "window_start": "2026-03-01T00:00:00Z",
+      "window_end": "2026-03-15T00:00:00Z",
+      "count": 2,
+      "vfreebusy": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//freebusy-export//EN\r\nBEGIN:VFREEBUSY\r\nDTSTART:20260301T000000Z\r\nDTEND:20260315T000000Z\r\nFREEBUSY:20260302T100000Z/20260302T110000Z\r\nFREEBUSY:20260307T050000Z/20260309T040000Z\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n"
+    },
+    {
+      "calendar_id": "bob",
+      "window_start": "2026-03-01T00:00:00Z",
+      "window_end": "2026-03-15T00:00:00Z",
+      "count": 1,
+      "vfreebusy": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//freebusy-export//EN\r\nBEGIN:VFREEBUSY\r\nDTSTART:20260301T000000Z\r\nDTEND:20260315T000000Z\r\nFREEBUSY:20260304T150000Z/20260305T150000Z\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n"
+    }
+  ]
+}
+```
+
+`vfreebusy` is complete `VCALENDAR`/`VFREEBUSY` iCalendar text with CRLF
+line endings; each `FREEBUSY` line is a UTC period
+(`start/end`, default busy type), ready to be fed to any RFC 5545 parser.
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -1113,6 +1218,14 @@ UTC-aware (naive or with a non-UTC offset), an `end` not strictly later
 than its `start`, duplicate starts, overlapping intervals (touching
 equal-length intervals are allowed), or instances of unequal duration.
 The endpoints accepts unsorted input; instances are sorted internally.
+
+`/freebusy-export` returns `422` for: `window_start >= window_end`, an
+empty `calendars` list, duplicate `calendar_id` values, an empty/missing
+`calendar_id` or `timezone`, an unknown calendar `timezone` (non-IANA
+name), and — per calendar, with the offending `calendar_id` quoted in
+`detail` — any `/expand` failure (unparsable ICS, invalid recurrence,
+unknown `TZID`, missing `DTSTART`/`UID`, the 10 000-occurrence cap) or a
+`TRANSP` value other than `OPAQUE`/`TRANSPARENT`.
 
 ## Semantics and limitations
 
@@ -1302,6 +1415,39 @@ The endpoints accepts unsorted input; instances are sorted internally.
   as `/expand`; it only competes when the expanded start/end set equals the
   submitted set exactly, so the returned `ics` always re-expands faithfully.
 
+### Free/busy semantics
+
+- **Same engine as `/expand`**: each calendar is expanded over the window
+  padded by one day on each side. The padding only matters for `DATE`
+  all-day events: the expander stores their authored dates as floating
+  midnights normalized to UTC, and a day reinterpreted in a far-eastern or
+  far-western timezone can differ from that frame by up to the largest civil
+  offset, so without padding an edge-of-window all-day event could be
+  missed. Timed instances are clipped to the real window afterwards.
+- **Busy vs transparent**: `STATUS:CANCELLED` instances and instances with
+  effective `TRANSP:TRANSPARENT` contribute no busy time; everything else
+  (the RFC 5545 default `OPAQUE` included) does. The effective `TRANSP` is
+  the master event's for recurring instances; a `RECURRENCE-ID` override
+  declaring `TRANSP` replaces it for that occurrence only, and one without
+  `TRANSP` keeps inheriting (mirroring `ATTENDEE`/`SUMMARY` inheritance).
+  A `TRANSP` value other than `OPAQUE`/`TRANSPARENT` fails the request with
+  `422`.
+- **All-day local days**: a `DATE` instance covers every authored date from
+  `DTSTART` up to (but not including) a `DATE` `DTEND`. Each boundary is
+  built as local midnight in the calendar's own IANA timezone with
+  `zoneinfo` and converted per date, so DST transition days are 23 or 25
+  hours long; consecutive all-day days whose UTC spans touch are merged.
+- **Clipping and merging**: every busy span is intersected with the
+  half-open window first, then merged with overlapping or touching spans
+  (`[a, b)` + `[b, c)` leave no free instant). Non-positive-duration spans
+  disappear in the clip.
+- **Output shape and order**: calendars come back in request order under
+  their `calendar_id`; each `vfreebusy` is a complete CRLF-delimited
+  `VCALENDAR` containing one `VFREEBUSY` with the window as `DTSTART`/
+  `DTEND` and `FREEBUSY` UTC periods (default busy type, no `FBTYPE`)
+  sorted by start and then end. An all-free calendar keeps an empty
+  `VFREEBUSY`.
+
 ## Development
 
 ```bash
@@ -1317,8 +1463,10 @@ app/main.py          FastAPI app: POST /expand, POST /provenance,
                      POST /agenda, POST /alarms,
                      POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
-                     POST /compress-schedule, GET /health
-app/expander.py      recurrence expansion, override merging, TZ/DST handling
+                     POST /compress-schedule, POST /freebusy-export,
+                     GET /health
+app/expander.py      recurrence expansion, override merging, TZ/DST handling,
+                     effective STATUS/TRANSP per instance
 app/provenance.py    per-occurrence provenance chains (RRULE/RDATE/DTSTART
                      generation, EXDATE, RECURRENCE-ID override, final values)
 app/compressor.py    shortest ICS over DAILY/WEEKLY RRULE grids + RDATE fallback
@@ -1329,6 +1477,8 @@ app/attendance.py    ATTENDEE inheritance, address normalization, PARTSTAT count
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 app/conflicts.py     half-open sweep for minimum-concurrency segments
+app/freebusy.py      per-calendar VFREEBUSY export, TRANSP inheritance,
+                     local all-day days, window clip/merge
 tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup

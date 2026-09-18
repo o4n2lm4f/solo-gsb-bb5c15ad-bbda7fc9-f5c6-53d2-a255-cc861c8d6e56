@@ -50,6 +50,11 @@ class Instance:
     # override that declares any ATTENDEE replaces the whole list (an
     # override without ATTENDEE keeps inheriting the master's).
     attendees: list = field(default_factory=list)
+    # Effective free/busy transparency in effect for this instance:
+    # "OPAQUE" (the RFC 5545 default; blocks busy time) or "TRANSPARENT".
+    # Recurring instances inherit the master's TRANSP; a RECURRENCE-ID
+    # override that declares TRANSP overrides it, otherwise it inherits.
+    transp: str = "OPAQUE"
 
 
 def expand_calendar(
@@ -93,6 +98,7 @@ def _expand_group(
 ) -> list[Instance]:
     for event in events:
         _validate_tzids(event)
+        _transp(event)
 
     masters = [e for e in events if "RECURRENCE-ID" not in e]
     overrides = [e for e in events if "RECURRENCE-ID" in e]
@@ -101,6 +107,7 @@ def _expand_group(
     master_summary: str | None = None
     master_duration: dt.timedelta | None = None
     master_attendees: list = []
+    master_transp = "OPAQUE"
 
     if masters:
         master = masters[0]
@@ -109,6 +116,7 @@ def _expand_group(
         master_duration = m_end - m_start
         master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
         master_attendees = _props(master, "ATTENDEE")
+        master_transp = _transp(master)
         if _status(master) != "CANCELLED":
             occurrences, recurring = _expand_master(
                 master, m_start, master_duration, window_start, window_end
@@ -125,6 +133,7 @@ def _expand_group(
                     all_day=m_all_day,
                     alarms=master_alarms,
                     attendees=master_attendees,
+                    transp=master_transp,
                 )
 
     for override in overrides:
@@ -150,6 +159,9 @@ def _expand_group(
             # An override declaring any ATTENDEE replaces the master's list
             # wholesale; one without keeps inheriting the master's.
             attendees=override_attendees if override_attendees else master_attendees,
+            # Likewise, an override declaring TRANSP overrides the master's
+            # transparency for this one occurrence; one without inherits it.
+            transp=_transp(override) if "TRANSP" in override else master_transp,
         )
 
     return list(instances.values())
@@ -328,6 +340,17 @@ def _datetimes(prop, ref_start: dt.datetime) -> list[dt.datetime]:
 
 def _status(event) -> str:
     return str(event.get("STATUS", "CONFIRMED")).upper()
+
+
+def _transp(event) -> str:
+    """Effective TRANSP value; RFC 5545 allows only OPAQUE/TRANSPARENT."""
+    value = str(event.get("TRANSP", "OPAQUE")).upper()
+    if value not in ("OPAQUE", "TRANSPARENT"):
+        raise ExpansionError(
+            f"VEVENT (UID {event.get('UID', '?')}) has invalid TRANSP "
+            f"value {value!r}; expected OPAQUE or TRANSPARENT"
+        )
+    return value
 
 
 def _text(event, name: str) -> str | None:
