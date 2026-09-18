@@ -50,6 +50,11 @@ class Instance:
     # override that declares any ATTENDEE replaces the whole list (an
     # override without ATTENDEE keeps inheriting the master's).
     attendees: list = field(default_factory=list)
+    # Effective TRANSP value ("OPAQUE" blocks time, "TRANSPARENT" does
+    # not). A recurring instance inherits the master event's TRANSP; a
+    # RECURRENCE-ID override that declares TRANSP explicitly replaces the
+    # inherited value for its instance.
+    transp: str = "OPAQUE"
 
 
 def expand_calendar(
@@ -101,10 +106,12 @@ def _expand_group(
     master_summary: str | None = None
     master_duration: dt.timedelta | None = None
     master_attendees: list = []
+    master_transp = "OPAQUE"
 
     if masters:
         master = masters[0]
         master_summary = _text(master, "SUMMARY")
+        master_transp = _transp(master)
         m_start, m_end, m_all_day = _event_times(master)
         master_duration = m_end - m_start
         master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
@@ -125,6 +132,7 @@ def _expand_group(
                     all_day=m_all_day,
                     alarms=master_alarms,
                     attendees=master_attendees,
+                    transp=master_transp,
                 )
 
     for override in overrides:
@@ -150,6 +158,9 @@ def _expand_group(
             # An override declaring any ATTENDEE replaces the master's list
             # wholesale; one without keeps inheriting the master's.
             attendees=override_attendees if override_attendees else master_attendees,
+            # Same rule for TRANSP: an explicit declaration replaces the
+            # inherited value, an absent one keeps the master's.
+            transp=_transp(override) if "TRANSP" in override else master_transp,
         )
 
     return list(instances.values())
@@ -328,6 +339,10 @@ def _datetimes(prop, ref_start: dt.datetime) -> list[dt.datetime]:
 
 def _status(event) -> str:
     return str(event.get("STATUS", "CONFIRMED")).upper()
+
+
+def _transp(event) -> str:
+    return str(event.get("TRANSP", "OPAQUE")).upper()
 
 
 def _text(event, name: str) -> str | None:

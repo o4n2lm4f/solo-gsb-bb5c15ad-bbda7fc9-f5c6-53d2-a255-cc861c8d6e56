@@ -27,6 +27,7 @@ from .compressor import CompressionError, compress_instances
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
+from .freebusy import FreeBusyError, busy_periods, render_vfreebusy
 from .provenance import (
     GenerationStep,
     OccurrenceProvenance,
@@ -41,7 +42,7 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.9.0",
+    version="1.10.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, trace the per-occurrence provenance chain "
     "(generation, EXDATE exclusion, RECURRENCE-ID reschedule/cancel) of one "
@@ -50,7 +51,8 @@ app = FastAPI(
     "segments across named calendars, expand VALARM reminders, report "
     "per-instance ATTENDEE participation status inside a query window, "
     "compress a set of equal-length UTC instances into the shortest "
-    "recurrence ICS, and validate raw iCalendar text structurally.",
+    "recurrence ICS, validate raw iCalendar text structurally, and export "
+    "per-calendar VFREEBUSY busy periods over a UTC window.",
 )
 
 
@@ -686,6 +688,62 @@ class CompressScheduleResponse(BaseModel):
     ics: str = Field(..., description="Complete, /expand-parsable iCalendar text")
 
 
+# ---------------------------------------------------------------------------
+# POST /freebusy-export
+# ---------------------------------------------------------------------------
+
+
+class FreeBusyCalendar(BaseModel):
+    """One calendar to export busy periods for."""
+
+    model_config = {"extra": "forbid"}
+
+    calendar_id: str = Field(
+        ..., min_length=1, description="Identifier echoed back with the export"
+    )
+    ics: str = Field(..., description="iCalendar (RFC 5545) text of this calendar")
+    timezone: str = Field(
+        ...,
+        min_length=1,
+        description="IANA timezone used to resolve DATE all-day events into "
+        "local full days, e.g. 'America/New_York'",
+    )
+
+
+class FreeBusyExportRequest(BaseModel):
+    calendars: list[FreeBusyCalendar] = Field(
+        default_factory=list,
+        description="Calendars to export; may be empty. calendar_id values "
+        "must be unique.",
+    )
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+
+
+class FreeBusyCalendarOut(BaseModel):
+    calendar_id: str
+    vfreebusy: str = Field(
+        ...,
+        description="Complete VCALENDAR text holding one VFREEBUSY component "
+        "with the merged, window-clipped FREEBUSY periods (UTC, sorted)",
+    )
+
+
+class FreeBusyExportResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    count: int
+    calendars: list[FreeBusyCalendarOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -925,4 +983,43 @@ def compress_schedule(request: CompressScheduleRequest) -> CompressScheduleRespo
         strategy=result.strategy,
         exception_count=result.exception_count,
         ics=result.ics,
+    )
+
+
+@app.post("/freebusy-export", response_model=FreeBusyExportResponse)
+def freebusy_export(request: FreeBusyExportRequest) -> FreeBusyExportResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    seen: set[str] = set()
+    exports: list[FreeBusyCalendarOut] = []
+    try:
+        for calendar in request.calendars:
+            if calendar.calendar_id in seen:
+                raise FreeBusyError(
+                    f"duplicate calendar_id: {calendar.calendar_id!r}"
+                )
+            seen.add(calendar.calendar_id)
+            periods = busy_periods(
+                calendar.ics, calendar.timezone, window_start, window_end
+            )
+            exports.append(
+                FreeBusyCalendarOut(
+                    calendar_id=calendar.calendar_id,
+                    vfreebusy=render_vfreebusy(
+                        calendar.calendar_id, periods, window_start, window_end
+                    ),
+                )
+            )
+    except FreeBusyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    exports.sort(key=lambda item: item.calendar_id)
+    return FreeBusyExportResponse(
+        window_start=window_start,
+        window_end=window_end,
+        count=len(exports),
+        calendars=exports,
     )
